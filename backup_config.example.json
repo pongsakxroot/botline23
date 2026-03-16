@@ -1,0 +1,41 @@
+{
+  "backup_root": "backups",
+  "zip_output": true,
+  "keep_sql_after_zip": false,
+  "telegram": {
+    "enabled": true,
+    "bot_token": "123456789:YOUR_TELEGRAM_BOT_TOKEN",
+    "chat_id": "YOUR_CHAT_ID"
+  },
+  "schedule": {
+    "enabled": true,
+    "mode": "daily",
+    "time": "02:00",
+    "interval_minutes": 60,
+    "timezone": "Asia/Bangkok"
+  },
+  "databases": [
+    {
+      "name": "main-mysql",
+      "type": "mysql",
+      "host": "127.0.0.1",
+      "port": 3306,
+      "username": "root",
+      "password": "your_mysql_password",
+      "database": "your_mysql_database",
+      "enabled": true,
+      "extra_args": []
+    },
+    {
+      "name": "main-postgres",
+      "type": "postgresql",
+      "host": "127.0.0.1",
+      "port": 5432,
+      "username": "postgres",
+      "password": "your_postgres_password",
+      "database": "your_postgres_database",
+      "enabled": true,
+      "extra_args": []
+    }
+  ]
+}
