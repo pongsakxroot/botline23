@@ -38,7 +38,12 @@ class TextQueueHandler(logging.Handler):
 
 
 class DatabaseDialog(tk.Toplevel):
-    def __init__(self, parent: tk.Misc, initial: dict | None = None) -> None:
+    def __init__(
+        self,
+        parent: tk.Misc,
+        initial: dict | None = None,
+        default_skip_log: bool = False,
+    ) -> None:
         super().__init__(parent)
         self.title("Database Settings")
         self.resizable(False, False)
@@ -53,7 +58,8 @@ class DatabaseDialog(tk.Toplevel):
         self.var_password = tk.StringVar(value=data.get("password", ""))
         self.var_database = tk.StringVar(value=data.get("database", ""))
         self.var_enabled = tk.BooleanVar(value=bool(data.get("enabled", True)))
-        self.var_skip_log_tables = tk.BooleanVar(value=bool(data.get("skip_log_tables", False)))
+        skip_log_default = data.get("skip_log_tables", default_skip_log)
+        self.var_skip_log_tables = tk.BooleanVar(value=bool(skip_log_default))
         self.var_exclude_tables = tk.StringVar(value=", ".join(data.get("exclude_tables", [])))
         self.var_extra_args = tk.StringVar(value=", ".join(data.get("extra_args", [])))
 
@@ -456,7 +462,7 @@ class BackupGUI(tk.Tk):
         return int(selected[0])
 
     def on_add_db(self) -> None:
-        dialog = DatabaseDialog(self)
+        dialog = DatabaseDialog(self, default_skip_log=bool(self.var_skip_log_tables.get()))
         self.wait_window(dialog)
         if dialog.result:
             self.db_entries.append(dialog.result)
@@ -468,7 +474,11 @@ class BackupGUI(tk.Tk):
         if idx is None:
             messagebox.showinfo("No selection", "Please select a database entry first.")
             return
-        dialog = DatabaseDialog(self, initial=self.db_entries[idx])
+        dialog = DatabaseDialog(
+            self,
+            initial=self.db_entries[idx],
+            default_skip_log=bool(self.var_skip_log_tables.get()),
+        )
         self.wait_window(dialog)
         if dialog.result:
             self.db_entries[idx] = dialog.result
