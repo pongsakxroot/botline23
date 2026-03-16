@@ -15,6 +15,8 @@
 - `mysqldump` (สำหรับ MySQL)
 - `pg_dump` (สำหรับ PostgreSQL)
 - Python 3.9+ (ใช้ `zoneinfo`)
+- `tkinter` (สำหรับ GUI)  
+  - Ubuntu/Debian: `sudo apt-get install -y python3-tk`
 
 ## เริ่มใช้งาน
 
