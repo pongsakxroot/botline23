@@ -32,6 +32,21 @@ cp backup_config.example.json backup_config.json
 
 ## คำสั่งใช้งาน
 
+### GUI (แนะนำสำหรับตั้งค่าง่าย)
+
+```bash
+python3 backup_gui.py
+```
+
+ความสามารถใน GUI:
+
+- ตั้งค่า backup/telegram/schedule ได้ผ่านฟอร์ม
+- จัดการรายการฐานข้อมูลแบบ Add/Edit/Remove
+- กด `Run Backup Now` เพื่อแบ็กอัปทันที
+- กด `Start Auto Backup` / `Stop Auto Backup` สำหรับงานอัตโนมัติ
+- ดู log การทำงานและเวลา backup ได้ในหน้าจอ
+- บันทึก/โหลดไฟล์ config JSON ได้
+
 ### 1) รันแบ็กอัปทันที (run once)
 
 ```bash
