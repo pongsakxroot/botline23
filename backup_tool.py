@@ -160,7 +160,17 @@ def zip_file(input_file: Path) -> Path:
     return zip_path
 
 
-def backup_database(db: DatabaseConfig, backup_dir: Path, zip_output: bool, keep_sql_after_zip: bool) -> Path:
+def format_duration(seconds: float) -> str:
+    total_seconds = max(int(round(seconds)), 0)
+    hours, rem = divmod(total_seconds, 3600)
+    minutes, secs = divmod(rem, 60)
+    return f"{hours:02d}:{minutes:02d}:{secs:02d}"
+
+
+def backup_database(
+    db: DatabaseConfig, backup_dir: Path, zip_output: bool, keep_sql_after_zip: bool
+) -> tuple[Path, float]:
+    started_at = time.perf_counter()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_file = backup_dir / f"{db.name}_{timestamp}.sql"
 
@@ -179,10 +189,12 @@ def backup_database(db: DatabaseConfig, backup_dir: Path, zip_output: bool, keep
         if not keep_sql_after_zip:
             out_file.unlink(missing_ok=True)
         logging.info("Backup zipped: %s", zip_path)
-        return zip_path
+        elapsed = time.perf_counter() - started_at
+        return zip_path, elapsed
 
     logging.info("Backup created: %s", out_file)
-    return out_file
+    elapsed = time.perf_counter() - started_at
+    return out_file, elapsed
 
 
 def parse_selected_targets(targets: str | None) -> set[str] | None:
@@ -199,33 +211,73 @@ def select_databases(databases: list[DatabaseConfig], selected: set[str] | None)
     return [db for db in enabled if db.name in selected]
 
 
-def execute_backup_cycle(cfg: AppConfig, selected_targets: set[str] | None) -> tuple[bool, list[Path], list[str]]:
+def execute_backup_cycle(
+    cfg: AppConfig, selected_targets: set[str] | None
+) -> tuple[bool, list[Path], list[str], float, dict[str, float]]:
+    cycle_started = time.perf_counter()
     backup_root = Path(cfg.backup_root)
     day_dir = backup_root / datetime.now().strftime("%Y-%m-%d")
     targets = select_databases(cfg.databases, selected_targets)
 
     if not targets:
-        return False, [], ["No target databases selected or enabled."]
+        return False, [], ["No target databases selected or enabled."], 0.0, {}
 
     success_files: list[Path] = []
     errors: list[str] = []
+    durations_by_db: dict[str, float] = {}
 
     for db in targets:
         try:
-            artifact = backup_database(
+            artifact, elapsed = backup_database(
                 db=db,
                 backup_dir=day_dir,
                 zip_output=cfg.zip_output,
                 keep_sql_after_zip=cfg.keep_sql_after_zip,
             )
             success_files.append(artifact)
+            durations_by_db[db.name] = elapsed
+            logging.info("Backup %s completed in %s", db.name, format_duration(elapsed))
         except Exception as exc:
             msg = f"{db.name}: {exc}"
             logging.exception("Backup failed for %s", db.name)
             errors.append(msg)
 
     overall_success = len(errors) == 0
-    return overall_success, success_files, errors
+    total_elapsed = time.perf_counter() - cycle_started
+    return overall_success, success_files, errors, total_elapsed, durations_by_db
+
+
+def build_result_message(
+    success: bool,
+    files: list[Path],
+    errors: list[str],
+    total_elapsed: float,
+    durations_by_db: dict[str, float],
+) -> str:
+    lines: list[str] = []
+    if success:
+        lines.append("✅ Backup success")
+    else:
+        lines.append("❌ Backup finished with errors")
+
+    lines.append(f"Total time: {format_duration(total_elapsed)}")
+
+    if durations_by_db:
+        lines.append("Per database:")
+        for name, seconds in durations_by_db.items():
+            lines.append(f"- {name}: {format_duration(seconds)}")
+
+    if files:
+        lines.append("Artifacts:")
+        for path in files:
+            lines.append(f"- {path}")
+
+    if errors:
+        lines.append("Errors:")
+        for err in errors:
+            lines.append(f"- {err}")
+
+    return "\n".join(lines)
 
 
 def next_daily_run(schedule_time: str, timezone_name: str) -> datetime:
@@ -267,11 +319,8 @@ def run_scheduler(cfg: AppConfig, selected_targets: set[str] | None) -> None:
                 logging.info("Sleeping %s minute(s) before next run", interval)
                 time.sleep(interval * 60)
 
-        success, files, errors = execute_backup_cycle(cfg, selected_targets)
-        if success:
-            msg = "✅ Backup success\n" + "\n".join(f"- {p}" for p in files)
-        else:
-            msg = "❌ Backup finished with errors\n" + "\n".join(f"- {e}" for e in errors)
+        success, files, errors, total_elapsed, durations_by_db = execute_backup_cycle(cfg, selected_targets)
+        msg = build_result_message(success, files, errors, total_elapsed, durations_by_db)
         send_telegram_message(cfg.telegram, msg)
 
 
@@ -310,14 +359,13 @@ def main() -> int:
         run_scheduler(cfg, selected_targets)
         return 0
 
-    success, files, errors = execute_backup_cycle(cfg, selected_targets)
+    success, files, errors, total_elapsed, durations_by_db = execute_backup_cycle(cfg, selected_targets)
+    msg = build_result_message(success, files, errors, total_elapsed, durations_by_db)
     if success:
-        msg = "✅ Backup success\n" + "\n".join(f"- {p}" for p in files)
-        logging.info("Backup completed")
+        logging.info("Backup completed in %s", format_duration(total_elapsed))
         send_telegram_message(cfg.telegram, msg)
         return 0
 
-    msg = "❌ Backup finished with errors\n" + "\n".join(f"- {e}" for e in errors)
     logging.error(msg)
     send_telegram_message(cfg.telegram, msg)
     return 1
