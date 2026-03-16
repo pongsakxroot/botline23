@@ -2,6 +2,8 @@
   "backup_root": "backups",
   "zip_output": true,
   "keep_sql_after_zip": false,
+  "skip_log_tables": true,
+  "log_table_keywords": ["log", "logs", "audit", "history", "event_log"],
   "telegram": {
     "enabled": true,
     "bot_token": "123456789:YOUR_TELEGRAM_BOT_TOKEN",
@@ -24,6 +26,8 @@
       "password": "your_mysql_password",
       "database": "your_mysql_database",
       "enabled": true,
+      "skip_log_tables": true,
+      "exclude_tables": ["temp_log_archive"],
       "extra_args": []
     },
     {
@@ -35,6 +39,8 @@
       "password": "your_postgres_password",
       "database": "your_postgres_database",
       "enabled": true,
+      "skip_log_tables": true,
+      "exclude_tables": ["public.old_logs"],
       "extra_args": []
     }
   ]

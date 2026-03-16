@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple GUI for database backup configuration and execution.
+Professional GUI for backup configuration and execution.
 """
 
 from __future__ import annotations
@@ -34,14 +34,13 @@ class TextQueueHandler(logging.Handler):
         self.target_queue = target_queue
 
     def emit(self, record: logging.LogRecord) -> None:
-        msg = self.format(record)
-        self.target_queue.put(msg)
+        self.target_queue.put(self.format(record))
 
 
 class DatabaseDialog(tk.Toplevel):
     def __init__(self, parent: tk.Misc, initial: dict | None = None) -> None:
         super().__init__(parent)
-        self.title("Database Setting")
+        self.title("Database Settings")
         self.resizable(False, False)
         self.result: dict | None = None
 
@@ -54,9 +53,11 @@ class DatabaseDialog(tk.Toplevel):
         self.var_password = tk.StringVar(value=data.get("password", ""))
         self.var_database = tk.StringVar(value=data.get("database", ""))
         self.var_enabled = tk.BooleanVar(value=bool(data.get("enabled", True)))
+        self.var_skip_log_tables = tk.BooleanVar(value=bool(data.get("skip_log_tables", False)))
+        self.var_exclude_tables = tk.StringVar(value=", ".join(data.get("exclude_tables", [])))
         self.var_extra_args = tk.StringVar(value=", ".join(data.get("extra_args", [])))
 
-        frame = ttk.Frame(self, padding=12)
+        frame = ttk.Frame(self, padding=16)
         frame.grid(row=0, column=0, sticky="nsew")
 
         fields = [
@@ -67,36 +68,39 @@ class DatabaseDialog(tk.Toplevel):
             ("Username", self.var_username),
             ("Password", self.var_password),
             ("Database", self.var_database),
+            ("Exclude tables (comma-separated)", self.var_exclude_tables),
             ("Extra args (comma-separated)", self.var_extra_args),
         ]
-
         for idx, (label, var) in enumerate(fields):
-            ttk.Label(frame, text=label).grid(row=idx, column=0, sticky="w", pady=3)
+            ttk.Label(frame, text=label).grid(row=idx, column=0, sticky="w", pady=4, padx=(0, 8))
             if label == "Type":
                 ttk.Combobox(
                     frame,
                     textvariable=var,
                     values=["mysql", "postgresql"],
                     state="readonly",
-                    width=32,
-                ).grid(row=idx, column=1, sticky="ew", pady=3)
+                    width=35,
+                ).grid(row=idx, column=1, sticky="ew", pady=4)
             elif label == "Password":
-                ttk.Entry(frame, textvariable=var, width=35, show="*").grid(
-                    row=idx, column=1, sticky="ew", pady=3
+                ttk.Entry(frame, textvariable=var, show="*", width=38).grid(
+                    row=idx, column=1, sticky="ew", pady=4
                 )
             else:
-                ttk.Entry(frame, textvariable=var, width=35).grid(
-                    row=idx, column=1, sticky="ew", pady=3
-                )
+                ttk.Entry(frame, textvariable=var, width=38).grid(row=idx, column=1, sticky="ew", pady=4)
 
         ttk.Checkbutton(frame, text="Enabled", variable=self.var_enabled).grid(
-            row=len(fields), column=1, sticky="w", pady=3
+            row=len(fields), column=1, sticky="w", pady=4
         )
+        ttk.Checkbutton(
+            frame,
+            text="Skip log tables (for this DB)",
+            variable=self.var_skip_log_tables,
+        ).grid(row=len(fields) + 1, column=1, sticky="w", pady=4)
 
         btn_frame = ttk.Frame(frame)
-        btn_frame.grid(row=len(fields) + 1, column=0, columnspan=2, sticky="e", pady=(10, 0))
-        ttk.Button(btn_frame, text="Cancel", command=self.destroy).grid(row=0, column=0, padx=4)
-        ttk.Button(btn_frame, text="Save", command=self.on_save).grid(row=0, column=1, padx=4)
+        btn_frame.grid(row=len(fields) + 2, column=0, columnspan=2, sticky="e", pady=(10, 0))
+        ttk.Button(btn_frame, text="Cancel", command=self.destroy).grid(row=0, column=0, padx=6)
+        ttk.Button(btn_frame, text="Save", command=self.on_save).grid(row=0, column=1, padx=6)
 
         frame.columnconfigure(1, weight=1)
         self.grab_set()
@@ -124,10 +128,12 @@ class DatabaseDialog(tk.Toplevel):
             "username": self.var_username.get().strip(),
             "password": self.var_password.get(),
             "database": self.var_database.get().strip(),
-            "enabled": self.var_enabled.get(),
-            "extra_args": [
-                item.strip() for item in self.var_extra_args.get().split(",") if item.strip()
+            "enabled": bool(self.var_enabled.get()),
+            "skip_log_tables": bool(self.var_skip_log_tables.get()),
+            "exclude_tables": [
+                item.strip() for item in self.var_exclude_tables.get().split(",") if item.strip()
             ],
+            "extra_args": [item.strip() for item in self.var_extra_args.get().split(",") if item.strip()],
         }
         self.destroy()
 
@@ -135,10 +141,12 @@ class DatabaseDialog(tk.Toplevel):
 class BackupGUI(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
-        self.title("Database Backup Tool (GUI)")
-        self.geometry("980x760")
+        self.title("Backup Studio Pro")
+        self.geometry("1120x790")
+        self.minsize(1040, 720)
 
         self.log_queue: "queue.Queue[str]" = queue.Queue()
+        self.ui_queue: "queue.Queue[tuple[str, object]]" = queue.Queue()
         self.scheduler_thread: threading.Thread | None = None
         self.run_thread: threading.Thread | None = None
         self.scheduler_stop_event = threading.Event()
@@ -149,6 +157,8 @@ class BackupGUI(tk.Tk):
         self.var_backup_root = tk.StringVar(value="backups")
         self.var_zip_output = tk.BooleanVar(value=True)
         self.var_keep_sql = tk.BooleanVar(value=False)
+        self.var_skip_log_tables = tk.BooleanVar(value=True)
+        self.var_log_keywords = tk.StringVar(value="log,logs,audit,history,event_log")
 
         self.var_tg_enabled = tk.BooleanVar(value=False)
         self.var_tg_token = tk.StringVar(value="")
@@ -160,15 +170,29 @@ class BackupGUI(tk.Tk):
         self.var_sched_interval = tk.StringVar(value="60")
         self.var_sched_timezone = tk.StringVar(value="Asia/Bangkok")
 
+        self.var_progress = tk.DoubleVar(value=0.0)
+        self.var_progress_text = tk.StringVar(value="Ready")
+
         self.btn_run_now: ttk.Button | None = None
         self.btn_start_auto: ttk.Button | None = None
         self.btn_stop_auto: ttk.Button | None = None
         self.tree_db: ttk.Treeview | None = None
         self.txt_log: tk.Text | None = None
 
+        self.setup_style()
         self.setup_logging()
         self.build_ui()
-        self.after(200, self.poll_log_queue)
+        self.after(150, self.poll_queues)
+
+    def setup_style(self) -> None:
+        style = ttk.Style(self)
+        available = style.theme_names()
+        if "clam" in available:
+            style.theme_use("clam")
+        style.configure("Header.TLabel", font=("Segoe UI", 14, "bold"))
+        style.configure("Subtle.TLabel", foreground="#4a4f55")
+        style.configure("Accent.TButton", padding=(12, 6))
+        style.configure("Treeview", rowheight=26)
 
     def setup_logging(self) -> None:
         formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
@@ -177,149 +201,217 @@ class BackupGUI(tk.Tk):
 
         root = logging.getLogger()
         root.setLevel(logging.INFO)
-        root.addHandler(handler)
+        if not any(isinstance(h, TextQueueHandler) for h in root.handlers):
+            root.addHandler(handler)
 
     def build_ui(self) -> None:
-        root = ttk.Frame(self, padding=10)
+        root = ttk.Frame(self, padding=12)
         root.pack(fill="both", expand=True)
 
-        self.build_config_frame(root)
-        self.build_main_settings_frame(root)
-        self.build_telegram_frame(root)
-        self.build_schedule_frame(root)
-        self.build_database_frame(root)
-        self.build_action_frame(root)
-        self.build_log_frame(root)
+        self.build_header(root)
+        self.build_action_bar(root)
+        self.build_notebook(root)
 
-    def build_config_frame(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Config File", padding=10)
-        frame.pack(fill="x", pady=5)
+    def build_header(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Project Config", padding=10)
+        frame.pack(fill="x", pady=(0, 8))
 
-        ttk.Label(frame, text="Path").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=self.var_config_path, width=65).grid(
-            row=0, column=1, sticky="ew", padx=5
+        ttk.Label(frame, text="Config Path").grid(row=0, column=0, sticky="w")
+        ttk.Entry(frame, textvariable=self.var_config_path, width=75).grid(
+            row=0, column=1, sticky="ew", padx=8
         )
         ttk.Button(frame, text="Browse", command=self.on_browse_config).grid(row=0, column=2, padx=3)
         ttk.Button(frame, text="Load", command=self.on_load_config).grid(row=0, column=3, padx=3)
         ttk.Button(frame, text="Save", command=self.on_save_config).grid(row=0, column=4, padx=3)
         frame.columnconfigure(1, weight=1)
 
-    def build_main_settings_frame(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Main Settings", padding=10)
-        frame.pack(fill="x", pady=5)
+    def build_action_bar(self, parent: ttk.Frame) -> None:
+        frame = ttk.LabelFrame(parent, text="Control Center", padding=10)
+        frame.pack(fill="x", pady=(0, 8))
 
-        ttk.Label(frame, text="Backup folder").grid(row=0, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=self.var_backup_root, width=35).grid(row=0, column=1, sticky="w")
-        ttk.Checkbutton(frame, text="Zip output", variable=self.var_zip_output).grid(
-            row=0, column=2, sticky="w", padx=8
-        )
-        ttk.Checkbutton(frame, text="Keep .sql after zip", variable=self.var_keep_sql).grid(
-            row=0, column=3, sticky="w"
-        )
-
-        ttk.Label(frame, text="Targets (optional)").grid(row=1, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=self.var_targets, width=50).grid(
-            row=1, column=1, columnspan=3, sticky="ew"
-        )
-        ttk.Label(frame, text="ex: main-mysql,main-postgres").grid(row=2, column=1, sticky="w", pady=(2, 0))
-        frame.columnconfigure(1, weight=1)
-
-    def build_telegram_frame(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Telegram Notification", padding=10)
-        frame.pack(fill="x", pady=5)
-
-        ttk.Checkbutton(frame, text="Enabled", variable=self.var_tg_enabled).grid(row=0, column=0, sticky="w")
-        ttk.Label(frame, text="Bot token").grid(row=1, column=0, sticky="w")
-        ttk.Entry(frame, textvariable=self.var_tg_token, width=45).grid(row=1, column=1, sticky="ew", padx=4)
-        ttk.Label(frame, text="Chat ID").grid(row=1, column=2, sticky="w")
-        ttk.Entry(frame, textvariable=self.var_tg_chat_id, width=25).grid(row=1, column=3, sticky="ew", padx=4)
-        frame.columnconfigure(1, weight=1)
-        frame.columnconfigure(3, weight=1)
-
-    def build_schedule_frame(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Schedule", padding=10)
-        frame.pack(fill="x", pady=5)
-
-        ttk.Checkbutton(frame, text="Enabled", variable=self.var_sched_enabled).grid(row=0, column=0, sticky="w")
-        ttk.Label(frame, text="Mode").grid(row=0, column=1, sticky="e")
-        ttk.Combobox(
+        self.btn_run_now = ttk.Button(frame, text="Run Backup Now", style="Accent.TButton", command=self.on_run_now)
+        self.btn_run_now.grid(row=0, column=0, padx=4, sticky="w")
+        self.btn_start_auto = ttk.Button(
             frame,
-            textvariable=self.var_sched_mode,
-            values=["daily", "interval"],
-            state="readonly",
-            width=12,
-        ).grid(row=0, column=2, sticky="w", padx=4)
-
-        ttk.Label(frame, text="Daily time (HH:MM)").grid(row=0, column=3, sticky="e")
-        ttk.Entry(frame, textvariable=self.var_sched_time, width=12).grid(row=0, column=4, sticky="w", padx=4)
-
-        ttk.Label(frame, text="Interval (min)").grid(row=0, column=5, sticky="e")
-        ttk.Entry(frame, textvariable=self.var_sched_interval, width=8).grid(row=0, column=6, sticky="w", padx=4)
-
-        ttk.Label(frame, text="Timezone").grid(row=0, column=7, sticky="e")
-        ttk.Entry(frame, textvariable=self.var_sched_timezone, width=18).grid(row=0, column=8, sticky="w", padx=4)
-
-    def build_database_frame(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Databases", padding=10)
-        frame.pack(fill="both", pady=5, expand=True)
-
-        columns = ("name", "type", "host", "database", "enabled")
-        self.tree_db = ttk.Treeview(frame, columns=columns, show="headings", height=8)
-        for col, width in (
-            ("name", 180),
-            ("type", 110),
-            ("host", 180),
-            ("database", 180),
-            ("enabled", 90),
-        ):
-            self.tree_db.heading(col, text=col)
-            self.tree_db.column(col, width=width, anchor="w")
-
-        self.tree_db.grid(row=0, column=0, columnspan=3, sticky="nsew")
-        ttk.Button(frame, text="Add", command=self.on_add_db).grid(row=1, column=0, sticky="w", pady=6)
-        ttk.Button(frame, text="Edit", command=self.on_edit_db).grid(row=1, column=1, sticky="w", pady=6)
-        ttk.Button(frame, text="Remove", command=self.on_remove_db).grid(row=1, column=2, sticky="w", pady=6)
-
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
-
-    def build_action_frame(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Actions", padding=10)
-        frame.pack(fill="x", pady=5)
-
-        self.btn_run_now = ttk.Button(frame, text="Run Backup Now", command=self.on_run_now)
-        self.btn_run_now.grid(row=0, column=0, padx=4)
-
-        self.btn_start_auto = ttk.Button(frame, text="Start Auto Backup", command=self.on_start_auto)
-        self.btn_start_auto.grid(row=0, column=1, padx=4)
-
+            text="Start Auto Backup",
+            style="Accent.TButton",
+            command=self.on_start_auto,
+        )
+        self.btn_start_auto.grid(row=0, column=1, padx=4, sticky="w")
         self.btn_stop_auto = ttk.Button(
             frame,
             text="Stop Auto Backup",
             command=self.on_stop_auto,
             state="disabled",
         )
-        self.btn_stop_auto.grid(row=0, column=2, padx=4)
+        self.btn_stop_auto.grid(row=0, column=2, padx=4, sticky="w")
+        ttk.Button(frame, text="Clear Log", command=self.on_clear_log).grid(row=0, column=3, padx=4, sticky="w")
 
-    def build_log_frame(self, parent: ttk.Frame) -> None:
-        frame = ttk.LabelFrame(parent, text="Log", padding=10)
-        frame.pack(fill="both", expand=True, pady=5)
+        ttk.Label(frame, textvariable=self.var_progress_text, style="Subtle.TLabel").grid(
+            row=0, column=4, sticky="e", padx=(12, 4)
+        )
+        progress = ttk.Progressbar(
+            frame,
+            variable=self.var_progress,
+            mode="determinate",
+            maximum=100,
+            length=260,
+        )
+        progress.grid(row=0, column=5, sticky="e", padx=4)
+        frame.columnconfigure(4, weight=1)
 
-        self.txt_log = tk.Text(frame, height=12, wrap="word")
-        scrollbar = ttk.Scrollbar(frame, orient="vertical", command=self.txt_log.yview)
+    def build_notebook(self, parent: ttk.Frame) -> None:
+        notebook = ttk.Notebook(parent)
+        notebook.pack(fill="both", expand=True)
+
+        tab_general = ttk.Frame(notebook, padding=12)
+        tab_databases = ttk.Frame(notebook, padding=12)
+        tab_schedule = ttk.Frame(notebook, padding=12)
+        tab_telegram = ttk.Frame(notebook, padding=12)
+        tab_monitor = ttk.Frame(notebook, padding=12)
+
+        notebook.add(tab_general, text="General")
+        notebook.add(tab_databases, text="Databases")
+        notebook.add(tab_schedule, text="Schedule")
+        notebook.add(tab_telegram, text="Telegram")
+        notebook.add(tab_monitor, text="Monitor")
+
+        self.build_general_tab(tab_general)
+        self.build_databases_tab(tab_databases)
+        self.build_schedule_tab(tab_schedule)
+        self.build_telegram_tab(tab_telegram)
+        self.build_monitor_tab(tab_monitor)
+
+    def build_general_tab(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="General Backup Settings", style="Header.TLabel").grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 10)
+        )
+        ttk.Label(parent, text="Backup folder").grid(row=1, column=0, sticky="w")
+        ttk.Entry(parent, textvariable=self.var_backup_root, width=40).grid(row=1, column=1, sticky="w", padx=8)
+
+        ttk.Checkbutton(parent, text="Zip output files", variable=self.var_zip_output).grid(
+            row=2, column=0, sticky="w", pady=5
+        )
+        ttk.Checkbutton(parent, text="Keep .sql after zip", variable=self.var_keep_sql).grid(
+            row=2, column=1, sticky="w", pady=5
+        )
+        ttk.Checkbutton(
+            parent,
+            text="Skip log tables automatically",
+            variable=self.var_skip_log_tables,
+        ).grid(row=3, column=0, sticky="w", pady=5)
+
+        ttk.Label(parent, text="Log table keywords").grid(row=3, column=1, sticky="e")
+        ttk.Entry(parent, textvariable=self.var_log_keywords, width=50).grid(row=3, column=2, sticky="ew", padx=8)
+        ttk.Label(parent, text="Targets (optional)").grid(row=4, column=0, sticky="w")
+        ttk.Entry(parent, textvariable=self.var_targets, width=70).grid(row=4, column=1, columnspan=2, sticky="ew", padx=8)
+        ttk.Label(parent, text="Example: main-mysql,main-postgres", style="Subtle.TLabel").grid(
+            row=5, column=1, columnspan=2, sticky="w", pady=(4, 0)
+        )
+        parent.columnconfigure(2, weight=1)
+
+    def build_databases_tab(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Database Connections", style="Header.TLabel").grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, 10)
+        )
+
+        columns = ("name", "type", "host", "database", "skip_logs", "exclude", "enabled")
+        self.tree_db = ttk.Treeview(parent, columns=columns, show="headings", height=14)
+        specs = [
+            ("name", 160, "Name"),
+            ("type", 100, "Type"),
+            ("host", 180, "Host"),
+            ("database", 180, "Database"),
+            ("skip_logs", 90, "Skip log"),
+            ("exclude", 180, "Exclude tables"),
+            ("enabled", 80, "Enabled"),
+        ]
+        for key, width, title in specs:
+            self.tree_db.heading(key, text=title)
+            self.tree_db.column(key, width=width, anchor="w")
+
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=self.tree_db.yview)
+        self.tree_db.configure(yscrollcommand=scrollbar.set)
+        self.tree_db.grid(row=1, column=0, columnspan=3, sticky="nsew")
+        scrollbar.grid(row=1, column=3, sticky="ns")
+
+        ttk.Button(parent, text="Add", command=self.on_add_db).grid(row=2, column=0, sticky="w", pady=8)
+        ttk.Button(parent, text="Edit", command=self.on_edit_db).grid(row=2, column=1, sticky="w", pady=8)
+        ttk.Button(parent, text="Remove", command=self.on_remove_db).grid(row=2, column=2, sticky="w", pady=8)
+        parent.rowconfigure(1, weight=1)
+        parent.columnconfigure(2, weight=1)
+
+    def build_schedule_tab(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Schedule Settings", style="Header.TLabel").grid(
+            row=0, column=0, columnspan=4, sticky="w", pady=(0, 10)
+        )
+        ttk.Checkbutton(parent, text="Enable schedule", variable=self.var_sched_enabled).grid(
+            row=1, column=0, sticky="w", pady=6
+        )
+        ttk.Label(parent, text="Mode").grid(row=1, column=1, sticky="e")
+        ttk.Combobox(
+            parent,
+            textvariable=self.var_sched_mode,
+            values=["daily", "interval"],
+            state="readonly",
+            width=16,
+        ).grid(row=1, column=2, sticky="w", padx=6)
+
+        ttk.Label(parent, text="Daily time (HH:MM)").grid(row=2, column=1, sticky="e")
+        ttk.Entry(parent, textvariable=self.var_sched_time, width=18).grid(row=2, column=2, sticky="w", padx=6)
+        ttk.Label(parent, text="Interval minutes").grid(row=3, column=1, sticky="e")
+        ttk.Entry(parent, textvariable=self.var_sched_interval, width=18).grid(row=3, column=2, sticky="w", padx=6)
+        ttk.Label(parent, text="Timezone").grid(row=4, column=1, sticky="e")
+        ttk.Entry(parent, textvariable=self.var_sched_timezone, width=28).grid(row=4, column=2, sticky="w", padx=6)
+
+    def build_telegram_tab(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Telegram Notification", style="Header.TLabel").grid(
+            row=0, column=0, columnspan=3, sticky="w", pady=(0, 10)
+        )
+        ttk.Checkbutton(parent, text="Enabled", variable=self.var_tg_enabled).grid(row=1, column=0, sticky="w")
+        ttk.Label(parent, text="Bot token").grid(row=2, column=0, sticky="w", pady=6)
+        ttk.Entry(parent, textvariable=self.var_tg_token, width=70).grid(row=2, column=1, sticky="ew", padx=8)
+        ttk.Label(parent, text="Chat ID").grid(row=3, column=0, sticky="w", pady=6)
+        ttk.Entry(parent, textvariable=self.var_tg_chat_id, width=30).grid(row=3, column=1, sticky="w", padx=8)
+        parent.columnconfigure(1, weight=1)
+
+    def build_monitor_tab(self, parent: ttk.Frame) -> None:
+        ttk.Label(parent, text="Execution Monitor", style="Header.TLabel").pack(anchor="w", pady=(0, 10))
+        self.txt_log = tk.Text(parent, wrap="word", height=24, font=("Consolas", 10))
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=self.txt_log.yview)
         self.txt_log.configure(yscrollcommand=scrollbar.set)
-        self.txt_log.grid(row=0, column=0, sticky="nsew")
-        scrollbar.grid(row=0, column=1, sticky="ns")
-        frame.rowconfigure(0, weight=1)
-        frame.columnconfigure(0, weight=1)
+        self.txt_log.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
 
-    def poll_log_queue(self) -> None:
+    def poll_queues(self) -> None:
         while not self.log_queue.empty():
             line = self.log_queue.get()
             if self.txt_log is not None:
                 self.txt_log.insert("end", line + "\n")
                 self.txt_log.see("end")
-        self.after(200, self.poll_log_queue)
+
+        while not self.ui_queue.empty():
+            event, payload = self.ui_queue.get()
+            if event == "progress":
+                percent, text = payload  # type: ignore[misc]
+                self.set_progress(float(percent), str(text))
+            elif event == "run_done":
+                self.toggle_run_buttons(False)
+            elif event == "auto_started":
+                self.toggle_auto_buttons(True)
+            elif event == "auto_stopped":
+                self.toggle_auto_buttons(False)
+
+        self.after(150, self.poll_queues)
+
+    def set_progress(self, percent: float, text: str) -> None:
+        safe = max(0.0, min(100.0, percent))
+        self.var_progress.set(safe)
+        self.var_progress_text.set(f"{safe:5.1f}% | {text}")
+
+    def on_clear_log(self) -> None:
+        if self.txt_log is not None:
+            self.txt_log.delete("1.0", "end")
 
     def on_browse_config(self) -> None:
         path = filedialog.asksaveasfilename(
@@ -337,6 +429,9 @@ class BackupGUI(tk.Tk):
         for item in self.tree_db.get_children():
             self.tree_db.delete(item)
         for idx, db in enumerate(self.db_entries):
+            exclude_preview = ",".join(db.get("exclude_tables", []))
+            if len(exclude_preview) > 28:
+                exclude_preview = exclude_preview[:28] + "..."
             self.tree_db.insert(
                 "",
                 "end",
@@ -346,16 +441,11 @@ class BackupGUI(tk.Tk):
                     db.get("type", ""),
                     db.get("host", ""),
                     db.get("database", ""),
-                    str(db.get("enabled", True)),
+                    str(bool(db.get("skip_log_tables", False))),
+                    exclude_preview,
+                    str(bool(db.get("enabled", True))),
                 ),
             )
-
-    def on_add_db(self) -> None:
-        dialog = DatabaseDialog(self)
-        self.wait_window(dialog)
-        if dialog.result:
-            self.db_entries.append(dialog.result)
-            self.refresh_db_tree()
 
     def selected_db_index(self) -> int | None:
         if self.tree_db is None:
@@ -364,6 +454,14 @@ class BackupGUI(tk.Tk):
         if not selected:
             return None
         return int(selected[0])
+
+    def on_add_db(self) -> None:
+        dialog = DatabaseDialog(self)
+        self.wait_window(dialog)
+        if dialog.result:
+            self.db_entries.append(dialog.result)
+            self.refresh_db_tree()
+            logging.info("Database entry added: %s", dialog.result.get("name", ""))
 
     def on_edit_db(self) -> None:
         idx = self.selected_db_index()
@@ -375,19 +473,26 @@ class BackupGUI(tk.Tk):
         if dialog.result:
             self.db_entries[idx] = dialog.result
             self.refresh_db_tree()
+            logging.info("Database entry updated: %s", dialog.result.get("name", ""))
 
     def on_remove_db(self) -> None:
         idx = self.selected_db_index()
         if idx is None:
             messagebox.showinfo("No selection", "Please select a database entry first.")
             return
-        self.db_entries.pop(idx)
+        removed = self.db_entries.pop(idx)
         self.refresh_db_tree()
+        logging.info("Database entry removed: %s", removed.get("name", ""))
+
+    def parse_keywords(self) -> list[str]:
+        return [kw.strip() for kw in self.var_log_keywords.get().split(",") if kw.strip()]
 
     def load_values_from_config(self, cfg: AppConfig) -> None:
         self.var_backup_root.set(cfg.backup_root)
         self.var_zip_output.set(cfg.zip_output)
         self.var_keep_sql.set(cfg.keep_sql_after_zip)
+        self.var_skip_log_tables.set(cfg.skip_log_tables)
+        self.var_log_keywords.set(",".join(cfg.log_table_keywords))
 
         self.var_tg_enabled.set(cfg.telegram.enabled)
         self.var_tg_token.set(cfg.telegram.bot_token)
@@ -409,17 +514,23 @@ class BackupGUI(tk.Tk):
                 "password": db.password,
                 "database": db.database,
                 "enabled": db.enabled,
+                "skip_log_tables": bool(db.skip_log_tables),
+                "exclude_tables": list(db.exclude_tables),
                 "extra_args": list(db.extra_args),
             }
             for db in cfg.databases
         ]
         self.refresh_db_tree()
+        logging.info("Config loaded into GUI successfully.")
 
     def build_config_dict(self) -> dict:
+        interval = int(self.var_sched_interval.get().strip() or "60")
         return {
             "backup_root": self.var_backup_root.get().strip() or "backups",
             "zip_output": bool(self.var_zip_output.get()),
             "keep_sql_after_zip": bool(self.var_keep_sql.get()),
+            "skip_log_tables": bool(self.var_skip_log_tables.get()),
+            "log_table_keywords": self.parse_keywords(),
             "telegram": {
                 "enabled": bool(self.var_tg_enabled.get()),
                 "bot_token": self.var_tg_token.get().strip(),
@@ -429,7 +540,7 @@ class BackupGUI(tk.Tk):
                 "enabled": bool(self.var_sched_enabled.get()),
                 "mode": self.var_sched_mode.get().strip() or "daily",
                 "time": self.var_sched_time.get().strip() or "02:00",
-                "interval_minutes": int(self.var_sched_interval.get().strip() or "60"),
+                "interval_minutes": interval,
                 "timezone": self.var_sched_timezone.get().strip() or "UTC",
             },
             "databases": self.db_entries,
@@ -447,6 +558,7 @@ class BackupGUI(tk.Tk):
                 port = int(db.get("port", 0))
             except ValueError as exc:
                 raise ValueError(f"Invalid port in database: {db.get('name', '')}") from exc
+
             databases.append(
                 DatabaseConfig(
                     name=db.get("name", "").strip(),
@@ -457,6 +569,8 @@ class BackupGUI(tk.Tk):
                     password=db.get("password", ""),
                     database=db.get("database", "").strip(),
                     enabled=bool(db.get("enabled", True)),
+                    skip_log_tables=bool(db.get("skip_log_tables", False)),
+                    exclude_tables=list(db.get("exclude_tables", [])),
                     extra_args=list(db.get("extra_args", [])),
                 )
             )
@@ -465,6 +579,8 @@ class BackupGUI(tk.Tk):
             backup_root=self.var_backup_root.get().strip() or "backups",
             zip_output=bool(self.var_zip_output.get()),
             keep_sql_after_zip=bool(self.var_keep_sql.get()),
+            skip_log_tables=bool(self.var_skip_log_tables.get()),
+            log_table_keywords=self.parse_keywords(),
             telegram=TelegramConfig(
                 enabled=bool(self.var_tg_enabled.get()),
                 bot_token=self.var_tg_token.get().strip(),
@@ -503,12 +619,27 @@ class BackupGUI(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Save failed", str(exc))
 
+    def toggle_run_buttons(self, is_running: bool) -> None:
+        if self.btn_run_now is not None:
+            self.btn_run_now.configure(state="disabled" if is_running else "normal")
+        if self.btn_start_auto is not None:
+            self.btn_start_auto.configure(state="disabled" if is_running else "normal")
+
+    def toggle_auto_buttons(self, is_running: bool) -> None:
+        if self.btn_start_auto is not None:
+            self.btn_start_auto.configure(state="disabled" if is_running else "normal")
+        if self.btn_stop_auto is not None:
+            self.btn_stop_auto.configure(state="normal" if is_running else "disabled")
+
+    def report_progress(self, percent: float, message: str) -> None:
+        self.ui_queue.put(("progress", (percent, message)))
+        logging.info("Progress %.0f%% | %s", percent, message)
+
     def on_run_now(self) -> None:
         if self.run_thread and self.run_thread.is_alive():
             messagebox.showinfo("Busy", "Backup is already running.")
             return
-        if self.btn_run_now is not None:
-            self.btn_run_now.configure(state="disabled")
+        self.toggle_run_buttons(True)
         self.run_thread = threading.Thread(target=self.run_once_worker, daemon=True)
         self.run_thread.start()
 
@@ -517,7 +648,9 @@ class BackupGUI(tk.Tk):
             cfg = self.build_app_config()
             selected_targets = parse_selected_targets(self.var_targets.get().strip())
             success, files, errors, total_elapsed, durations_by_db = execute_backup_cycle(
-                cfg, selected_targets
+                cfg,
+                selected_targets,
+                progress_callback=self.report_progress,
             )
             msg = build_result_message(success, files, errors, total_elapsed, durations_by_db)
             logging.info(msg)
@@ -525,11 +658,7 @@ class BackupGUI(tk.Tk):
         except Exception:
             logging.exception("Backup run failed")
         finally:
-            self.after(0, self.enable_run_now_button)
-
-    def enable_run_now_button(self) -> None:
-        if self.btn_run_now is not None:
-            self.btn_run_now.configure(state="normal")
+            self.ui_queue.put(("run_done", None))
 
     def on_start_auto(self) -> None:
         if self.scheduler_thread and self.scheduler_thread.is_alive():
@@ -540,20 +669,19 @@ class BackupGUI(tk.Tk):
         except Exception as exc:
             messagebox.showerror("Invalid config", str(exc))
             return
-
         if not snapshot_cfg.schedule.enabled:
             messagebox.showwarning("Schedule disabled", "Schedule is disabled in settings.")
             return
 
         self.scheduler_stop_event.clear()
+        targets = self.var_targets.get().strip()
         self.scheduler_thread = threading.Thread(
-            target=self.auto_worker, args=(snapshot_cfg, self.var_targets.get().strip()), daemon=True
+            target=self.auto_worker,
+            args=(snapshot_cfg, targets),
+            daemon=True,
         )
         self.scheduler_thread.start()
-        if self.btn_start_auto is not None:
-            self.btn_start_auto.configure(state="disabled")
-        if self.btn_stop_auto is not None:
-            self.btn_stop_auto.configure(state="normal")
+        self.ui_queue.put(("auto_started", None))
         logging.info("Auto backup started.")
 
     def on_stop_auto(self) -> None:
@@ -569,27 +697,26 @@ class BackupGUI(tk.Tk):
             while not self.scheduler_stop_event.is_set():
                 if schedule.mode == "daily":
                     run_at = next_daily_run(schedule.time, schedule.timezone)
-                    logging.info("Next run at %s", run_at.isoformat())
+                    self.report_progress(0.0, f"Waiting for daily schedule: {run_at.isoformat()}")
                     now = datetime.now(run_at.tzinfo)
                     wait_seconds = max((run_at - now).total_seconds(), 0)
                     if self.scheduler_stop_event.wait(wait_seconds):
                         break
                 elif schedule.mode == "interval":
-                    interval_seconds = max(schedule.interval_minutes, 1) * 60
+                    interval_minutes = max(schedule.interval_minutes, 1)
                     if first_interval_cycle:
                         first_interval_cycle = False
                     else:
-                        logging.info(
-                            "Next run in %s minute(s)",
-                            max(schedule.interval_minutes, 1),
-                        )
-                        if self.scheduler_stop_event.wait(interval_seconds):
+                        self.report_progress(0.0, f"Waiting next run in {interval_minutes} minute(s)")
+                        if self.scheduler_stop_event.wait(interval_minutes * 60):
                             break
                 else:
                     raise ValueError("schedule.mode must be 'daily' or 'interval'")
 
                 success, files, errors, total_elapsed, durations_by_db = execute_backup_cycle(
-                    snapshot_cfg, selected_targets
+                    snapshot_cfg,
+                    selected_targets,
+                    progress_callback=self.report_progress,
                 )
                 msg = build_result_message(success, files, errors, total_elapsed, durations_by_db)
                 logging.info(msg)
@@ -597,14 +724,8 @@ class BackupGUI(tk.Tk):
         except Exception:
             logging.exception("Auto backup crashed")
         finally:
-            self.after(0, self.on_auto_stopped_ui)
-
-    def on_auto_stopped_ui(self) -> None:
-        if self.btn_start_auto is not None:
-            self.btn_start_auto.configure(state="normal")
-        if self.btn_stop_auto is not None:
-            self.btn_stop_auto.configure(state="disabled")
-        logging.info("Auto backup stopped.")
+            self.ui_queue.put(("auto_stopped", None))
+            self.report_progress(0.0, "Auto backup stopped")
 
 
 def main() -> int:

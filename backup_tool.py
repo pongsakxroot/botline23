@@ -14,6 +14,7 @@ import logging
 import os
 import subprocess
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -48,6 +49,8 @@ class DatabaseConfig:
     password: str
     database: str
     enabled: bool = True
+    skip_log_tables: bool | None = None
+    exclude_tables: list[str] = field(default_factory=list)
     extra_args: list[str] = field(default_factory=list)
 
 
@@ -56,6 +59,10 @@ class AppConfig:
     backup_root: str = "backups"
     zip_output: bool = True
     keep_sql_after_zip: bool = False
+    skip_log_tables: bool = False
+    log_table_keywords: list[str] = field(
+        default_factory=lambda: ["log", "logs", "audit", "history", "event_log"]
+    )
     telegram: TelegramConfig = field(default_factory=TelegramConfig)
     schedule: ScheduleConfig = field(default_factory=ScheduleConfig)
     databases: list[DatabaseConfig] = field(default_factory=list)
@@ -79,6 +86,11 @@ def load_config(config_path: Path) -> AppConfig:
         backup_root=raw.get("backup_root", "backups"),
         zip_output=raw.get("zip_output", True),
         keep_sql_after_zip=raw.get("keep_sql_after_zip", False),
+        skip_log_tables=raw.get("skip_log_tables", False),
+        log_table_keywords=raw.get(
+            "log_table_keywords",
+            ["log", "logs", "audit", "history", "event_log"],
+        ),
         telegram=telegram,
         schedule=schedule,
         databases=databases,
@@ -118,8 +130,69 @@ def run_subprocess(command: list[str], output_file: Path, env: dict[str, str] | 
         raise RuntimeError(f"Command failed: {' '.join(command)}\n{stderr_msg}")
 
 
-def build_mysql_command(db: DatabaseConfig) -> list[str]:
-    return [
+def run_subprocess_capture(
+    command: list[str], env: dict[str, str] | None = None
+) -> subprocess.CompletedProcess[bytes]:
+    return subprocess.run(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        check=False,
+        env=env,
+    )
+
+
+def safe_identifier(raw: str) -> str:
+    return raw.replace("`", "``").replace("'", "''")
+
+
+def should_skip_log_tables(cfg: AppConfig, db: DatabaseConfig) -> bool:
+    if db.skip_log_tables is not None:
+        return db.skip_log_tables
+    return cfg.skip_log_tables
+
+
+def discover_mysql_log_tables(db: DatabaseConfig, keywords: list[str]) -> list[str]:
+    cleaned = [kw.strip().lower() for kw in keywords if kw and kw.strip()]
+    if not cleaned:
+        return []
+
+    db_name = safe_identifier(db.database)
+    conditions = " OR ".join(f"LOWER(table_name) LIKE '%{safe_identifier(kw)}%'" for kw in cleaned)
+    query = (
+        "SELECT table_name FROM information_schema.tables "
+        f"WHERE table_schema = '{db_name}' AND ({conditions});"
+    )
+    command = [
+        "mysql",
+        "-N",
+        "-h",
+        db.host,
+        "-P",
+        str(db.port),
+        "-u",
+        db.username,
+        f"--password={db.password}",
+        "-e",
+        query,
+    ]
+
+    proc = run_subprocess_capture(command)
+    if proc.returncode != 0:
+        stderr_msg = proc.stderr.decode("utf-8", errors="replace")
+        logging.warning(
+            "Cannot discover MySQL log tables for %s. Skip auto-exclude. reason=%s",
+            db.name,
+            stderr_msg.strip(),
+        )
+        return []
+
+    raw_tables = proc.stdout.decode("utf-8", errors="replace").splitlines()
+    return [tbl.strip() for tbl in raw_tables if tbl.strip()]
+
+
+def build_mysql_command(db: DatabaseConfig, ignored_tables: list[str]) -> list[str]:
+    command = [
         "mysqldump",
         "-h",
         db.host,
@@ -131,11 +204,18 @@ def build_mysql_command(db: DatabaseConfig) -> list[str]:
         "--single-transaction",
         "--databases",
         db.database,
-        *db.extra_args,
     ]
+    for table in ignored_tables:
+        if "." in table:
+            scoped = table
+        else:
+            scoped = f"{db.database}.{table}"
+        command.append(f"--ignore-table={scoped}")
+    command.extend(db.extra_args)
+    return command
 
 
-def build_postgresql_command(db: DatabaseConfig) -> tuple[list[str], dict[str, str]]:
+def build_postgresql_command(db: DatabaseConfig, exclude_patterns: list[str]) -> tuple[list[str], dict[str, str]]:
     env = os.environ.copy()
     env["PGPASSWORD"] = db.password
     command = [
@@ -148,8 +228,10 @@ def build_postgresql_command(db: DatabaseConfig) -> tuple[list[str], dict[str, s
         db.username,
         "-d",
         db.database,
-        *db.extra_args,
     ]
+    for pattern in exclude_patterns:
+        command.extend(["--exclude-table", pattern])
+    command.extend(db.extra_args)
     return command, env
 
 
@@ -167,26 +249,42 @@ def format_duration(seconds: float) -> str:
     return f"{hours:02d}:{minutes:02d}:{secs:02d}"
 
 
-def backup_database(
-    db: DatabaseConfig, backup_dir: Path, zip_output: bool, keep_sql_after_zip: bool
-) -> tuple[Path, float]:
+def backup_database(db: DatabaseConfig, cfg: AppConfig, backup_dir: Path) -> tuple[Path, float]:
     started_at = time.perf_counter()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_file = backup_dir / f"{db.name}_{timestamp}.sql"
+    skip_log_tables = should_skip_log_tables(cfg, db)
+    keywords = [kw.strip() for kw in cfg.log_table_keywords if kw and kw.strip()]
+    excluded_tables = [tbl.strip() for tbl in db.exclude_tables if tbl and tbl.strip()]
 
     logging.info("Backing up %s (%s)...", db.name, db.db_type)
     if db.db_type == "mysql":
-        command = build_mysql_command(db)
+        auto_ignored: list[str] = []
+        if skip_log_tables:
+            auto_ignored = discover_mysql_log_tables(db, keywords)
+        ignored_tables = sorted({*excluded_tables, *auto_ignored})
+        if ignored_tables:
+            logging.info("MySQL excluded tables for %s: %s", db.name, ", ".join(ignored_tables))
+        command = build_mysql_command(db, ignored_tables)
         run_subprocess(command, out_file)
     elif db.db_type == "postgresql":
-        command, env = build_postgresql_command(db)
+        excluded_patterns = list(excluded_tables)
+        if skip_log_tables:
+            excluded_patterns.extend([f"*{kw}*" for kw in keywords])
+        if excluded_patterns:
+            logging.info(
+                "PostgreSQL excluded tables/patterns for %s: %s",
+                db.name,
+                ", ".join(excluded_patterns),
+            )
+        command, env = build_postgresql_command(db, excluded_patterns)
         run_subprocess(command, out_file, env=env)
     else:
         raise ValueError(f"Unsupported db type for {db.name}: {db.db_type}")
 
-    if zip_output:
+    if cfg.zip_output:
         zip_path = zip_file(out_file)
-        if not keep_sql_after_zip:
+        if not cfg.keep_sql_after_zip:
             out_file.unlink(missing_ok=True)
         logging.info("Backup zipped: %s", zip_path)
         elapsed = time.perf_counter() - started_at
@@ -212,38 +310,58 @@ def select_databases(databases: list[DatabaseConfig], selected: set[str] | None)
 
 
 def execute_backup_cycle(
-    cfg: AppConfig, selected_targets: set[str] | None
+    cfg: AppConfig,
+    selected_targets: set[str] | None,
+    progress_callback: Callable[[float, str], None] | None = None,
 ) -> tuple[bool, list[Path], list[str], float, dict[str, float]]:
+    def report_progress(percent: float, message: str) -> None:
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(percent, message)
+        except Exception:
+            logging.exception("Progress callback failed")
+
     cycle_started = time.perf_counter()
     backup_root = Path(cfg.backup_root)
     day_dir = backup_root / datetime.now().strftime("%Y-%m-%d")
     targets = select_databases(cfg.databases, selected_targets)
 
     if not targets:
+        report_progress(0.0, "No target databases selected or enabled.")
         return False, [], ["No target databases selected or enabled."], 0.0, {}
+
+    total_targets = len(targets)
+    report_progress(0.0, f"Backup started for {total_targets} database(s)")
 
     success_files: list[Path] = []
     errors: list[str] = []
     durations_by_db: dict[str, float] = {}
 
-    for db in targets:
+    for idx, db in enumerate(targets, start=1):
+        started_percent = ((idx - 1) / total_targets) * 100
+        report_progress(started_percent, f"Starting backup {idx}/{total_targets}: {db.name}")
         try:
             artifact, elapsed = backup_database(
                 db=db,
+                cfg=cfg,
                 backup_dir=day_dir,
-                zip_output=cfg.zip_output,
-                keep_sql_after_zip=cfg.keep_sql_after_zip,
             )
             success_files.append(artifact)
             durations_by_db[db.name] = elapsed
             logging.info("Backup %s completed in %s", db.name, format_duration(elapsed))
+            finished_percent = (idx / total_targets) * 100
+            report_progress(finished_percent, f"Completed {db.name} ({finished_percent:.0f}%)")
         except Exception as exc:
             msg = f"{db.name}: {exc}"
             logging.exception("Backup failed for %s", db.name)
             errors.append(msg)
+            finished_percent = (idx / total_targets) * 100
+            report_progress(finished_percent, f"Failed {db.name} ({finished_percent:.0f}%)")
 
     overall_success = len(errors) == 0
     total_elapsed = time.perf_counter() - cycle_started
+    report_progress(100.0, f"Backup cycle finished in {format_duration(total_elapsed)}")
     return overall_success, success_files, errors, total_elapsed, durations_by_db
 
 
